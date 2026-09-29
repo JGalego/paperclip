@@ -190,7 +190,9 @@ RDS_ENDPOINT=$(aws rds describe-db-instances \
   --db-instance-identifier paperclip-db \
   --query 'DBInstances[0].Endpoint.Address' --output text)
 
-DATABASE_URL="postgresql://paperclip:${DB_PASSWORD}@${RDS_ENDPOINT}:5432/paperclip"
+# RDS Postgres 15+ rejects unencrypted connections by default
+# (rds.force_ssl=1), so the URL must request TLS.
+DATABASE_URL="postgresql://paperclip:${DB_PASSWORD}@${RDS_ENDPOINT}:5432/paperclip?sslmode=require"
 ```
 
 ## 5. Create S3 Bucket
@@ -333,7 +335,12 @@ ASC_ARN=$(aws apprunner create-auto-scaling-configuration \
 ## 9. Create App Runner Service
 
 ```bash
-SECRETS_ARN_PREFIX=arn:aws:secretsmanager:$AWS_REGION:$AWS_ACCOUNT_ID:secret:paperclip
+# App Runner needs each secret's full ARN, including the random suffix
+# Secrets Manager appends to the name. A partial ARN fails at deploy time.
+secret_arn() {
+  aws secretsmanager describe-secret \
+    --secret-id paperclip/$1 --query ARN --output text
+}
 
 cat > /tmp/paperclip-apprunner.json <<EOF
 {
@@ -366,12 +373,12 @@ cat > /tmp/paperclip-apprunner.json <<EOF
           "PAPERCLIP_STORAGE_S3_REGION": "$AWS_REGION"
         },
         "RuntimeEnvironmentSecrets": {
-          "DATABASE_URL": "$SECRETS_ARN_PREFIX/database-url",
-          "BETTER_AUTH_SECRET": "$SECRETS_ARN_PREFIX/better-auth-secret",
-          "PAPERCLIP_SECRETS_MASTER_KEY": "$SECRETS_ARN_PREFIX/secrets-master-key",
-          "ANTHROPIC_API_KEY": "$SECRETS_ARN_PREFIX/anthropic-api-key",
-          "OPENAI_API_KEY": "$SECRETS_ARN_PREFIX/openai-api-key",
-          "GITHUB_TOKEN": "$SECRETS_ARN_PREFIX/github-token"
+          "DATABASE_URL": "$(secret_arn database-url)",
+          "BETTER_AUTH_SECRET": "$(secret_arn better-auth-secret)",
+          "PAPERCLIP_SECRETS_MASTER_KEY": "$(secret_arn secrets-master-key)",
+          "ANTHROPIC_API_KEY": "$(secret_arn anthropic-api-key)",
+          "OPENAI_API_KEY": "$(secret_arn openai-api-key)",
+          "GITHUB_TOKEN": "$(secret_arn github-token)"
         }
       }
     }
@@ -485,11 +492,12 @@ docker run --rm -it \
   -e PAPERCLIP_DEPLOYMENT_MODE=authenticated \
   -e PAPERCLIP_DEPLOYMENT_EXPOSURE=public \
   -e PAPERCLIP_PUBLIC_URL="https://$PAPERCLIP_DOMAIN" \
+  -e HEARTBEAT_SCHEDULER_ENABLED=false \
   $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/paperclip-server:latest \
   npx --yes paperclipai onboard
 ```
 
-Choose **Quickstart**. The wizard reads the environment above, writes a config inside the throwaway container, and prints a bootstrap invite URL. Answer **No** when it asks to start Paperclip, so it does not run a second server against the same database.
+Choose **Quickstart**. The wizard reads the environment above, writes a config inside the throwaway container, and prints a bootstrap invite URL. When it asks **Start Paperclip now?**, choose **No**. The default is **Yes**, so pressing Enter starts a second server against the same database. `HEARTBEAT_SCHEDULER_ENABLED=false` keeps that server from running scheduled work if it starts by mistake; stop the container with `Ctrl+C` if it does.
 
 > **Note:** `paperclipai auth bootstrap-ceo` alone does not work here. It needs a config file, and the App Runner service is configured through environment variables only.
 

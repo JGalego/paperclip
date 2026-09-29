@@ -163,7 +163,9 @@ RDS_ENDPOINT=$(aws rds describe-db-instances \
   --db-instance-identifier paperclip-db \
   --query 'DBInstances[0].Endpoint.Address' --output text)
 
-DATABASE_URL="postgresql://paperclip:${DB_PASSWORD}@${RDS_ENDPOINT}:5432/paperclip"
+# RDS Postgres 15+ rejects unencrypted connections by default
+# (rds.force_ssl=1), so the URL must request TLS.
+DATABASE_URL="postgresql://paperclip:${DB_PASSWORD}@${RDS_ENDPOINT}:5432/paperclip?sslmode=require"
 ```
 
 ## 6. Create EFS Filesystem
@@ -492,14 +494,15 @@ kubectl run paperclip-bootstrap -n paperclip --rm -it --restart=Never \
         "env": [
           {"name": "PAPERCLIP_DEPLOYMENT_MODE", "value": "authenticated"},
           {"name": "PAPERCLIP_DEPLOYMENT_EXPOSURE", "value": "public"},
-          {"name": "PAPERCLIP_PUBLIC_URL", "value": "https://'$PAPERCLIP_DOMAIN'"}
+          {"name": "PAPERCLIP_PUBLIC_URL", "value": "https://'$PAPERCLIP_DOMAIN'"},
+          {"name": "HEARTBEAT_SCHEDULER_ENABLED", "value": "false"}
         ]
       }]
     }
   }'
 ```
 
-Choose **Quickstart**. The wizard reads the environment above, writes a config inside the throwaway pod, and prints a bootstrap invite URL. Answer **No** when it asks to start Paperclip, so it does not run a second server against the same database.
+Choose **Quickstart**. The wizard reads the environment above, writes a config inside the throwaway pod, and prints a bootstrap invite URL. When it asks **Start Paperclip now?**, choose **No**. The default is **Yes**, so pressing Enter starts a second server against the same database. `HEARTBEAT_SCHEDULER_ENABLED=false` keeps that server from running scheduled work if it starts by mistake; stop the container with `Ctrl+C` if it does.
 
 > **Note:** `paperclipai auth bootstrap-ceo` alone does not work here. It needs a config file, and the Deployment is configured through environment variables only.
 
