@@ -451,7 +451,7 @@ docker run --rm -it \
   npx --yes paperclipai onboard
 ```
 
-Choose **Quickstart**. The wizard reads the environment above, writes a config inside the throwaway container, and prints a bootstrap invite URL. When it asks **Start Paperclip now?**, choose **No**. The default is **Yes**, so pressing Enter starts a second server against the same database. If that happens, stop the container with `Ctrl+C` right away. `HEARTBEAT_SCHEDULER_ENABLED=false` stops that server from waking agents, but it still runs other background work, such as execution-status sweeps and database backups. On a fresh instance there are no companies or agents yet, so this work has nothing to act on.
+Choose **Quickstart**. The wizard reads the environment above, writes a config inside the throwaway container, and prints a bootstrap invite URL. When it asks **Start Paperclip now?**, use the arrow keys to select **No**, then press Enter. The default is **Yes**, so pressing Enter starts a second server against the same database. If that happens, stop the container with `Ctrl+C` right away. `HEARTBEAT_SCHEDULER_ENABLED=false` stops that server from waking agents, but it still runs other background work, such as execution-status sweeps and database backups. On a fresh instance there are no companies or agents yet, so this work has nothing to act on.
 
 > **Note:** `paperclipai auth bootstrap-ceo` alone does not work here. It needs a config file, and the App Runner service is configured through environment variables only.
 

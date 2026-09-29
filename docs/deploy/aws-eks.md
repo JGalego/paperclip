@@ -186,8 +186,19 @@ EFS_ID=$(aws efs create-file-system \
   --tags Key=Name,Value=paperclip-data \
   --query 'FileSystemId' --output text)
 
-# Create mount targets in each subnet
-for SUBNET in $SUBNET_1 $SUBNET_2; do
+# Wait until the file system is available before adding mount targets
+until [ "$(aws efs describe-file-systems --file-system-id $EFS_ID \
+  --query 'FileSystems[0].LifeCycleState' --output text)" = "available" ]; do
+  sleep 5
+done
+
+# Create a mount target in every private subnet. Nodes can run in any
+# of them, and a pod cannot mount EFS in an AZ without a mount target.
+PRIVATE_SUBNETS=$(aws ec2 describe-subnets \
+  --filters Name=vpc-id,Values=$VPC_ID \
+  --query 'Subnets[?MapPublicIpOnLaunch==`false`].SubnetId' \
+  --output text)
+for SUBNET in $PRIVATE_SUBNETS; do
   aws efs create-mount-target \
     --file-system-id $EFS_ID \
     --subnet-id $SUBNET \
@@ -195,8 +206,11 @@ for SUBNET in $SUBNET_1 $SUBNET_2; do
 done
 
 # Wait for mount targets
-aws efs describe-mount-targets --file-system-id $EFS_ID
+aws efs describe-mount-targets --file-system-id $EFS_ID \
+  --query 'MountTargets[].[AvailabilityZoneName,LifeCycleState]' --output text
 ```
+
+> **Note:** `eksctl` creates private subnets in up to three AZs. If a mount target is missing in a node's AZ, the pod stays in `ContainerCreating` with `Failed to resolve "fs-....efs.<region>.amazonaws.com"`.
 
 Install the EFS CSI driver as an EKS add-on, with an IAM role for its service account:
 
@@ -389,7 +403,7 @@ kubectl run paperclip-bootstrap -n paperclip --rm -it --restart=Never \
   }'
 ```
 
-Choose **Quickstart**. The wizard reads the environment above, writes a config inside the throwaway pod, and prints a bootstrap invite URL. When it asks **Start Paperclip now?**, choose **No**. The default is **Yes**, so pressing Enter starts a second server against the same database. If that happens, stop the container with `Ctrl+C` right away. `HEARTBEAT_SCHEDULER_ENABLED=false` stops that server from waking agents, but it still runs other background work, such as execution-status sweeps and database backups. On a fresh instance there are no companies or agents yet, so this work has nothing to act on.
+Choose **Quickstart**. The wizard reads the environment above, writes a config inside the throwaway pod, and prints a bootstrap invite URL. When it asks **Start Paperclip now?**, use the arrow keys to select **No**, then press Enter. The default is **Yes**, so pressing Enter starts a second server against the same database. If that happens, stop the container with `Ctrl+C` right away. `HEARTBEAT_SCHEDULER_ENABLED=false` stops that server from waking agents, but it still runs other background work, such as execution-status sweeps and database backups. On a fresh instance there are no companies or agents yet, so this work has nothing to act on.
 
 > **Note:** `paperclipai auth bootstrap-ceo` alone does not work here. It needs a config file, and the Deployment is configured through environment variables only.
 
