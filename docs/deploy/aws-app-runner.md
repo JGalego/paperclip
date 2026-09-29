@@ -246,6 +246,8 @@ aws secretsmanager create-secret \
 
 > **Warning:** Back up `paperclip/secrets-master-key`. If it is lost, every secret stored in Paperclip becomes unreadable.
 
+> **Note:** Codex agents need `OPENAI_API_KEY` bound per agent under **Agents → (agent) → Secrets & variables**. The server-level variable is not used, and a Codex run without a per-agent key fails with `configuration_incomplete`.
+
 ## 7. IAM Roles
 
 App Runner uses two roles: an access role (pulls the image from ECR) and an instance role (application permissions at runtime, including reading secrets and writing to S3).

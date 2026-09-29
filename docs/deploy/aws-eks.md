@@ -261,6 +261,8 @@ kubectl create secret generic paperclip-secrets \
 
 > **Note:** Kubernetes Secrets are only base64-encoded. Enable [envelope encryption with a KMS key](https://docs.aws.amazon.com/eks/latest/userguide/enable-kms.html) on the cluster, or sync from AWS Secrets Manager with the External Secrets Operator, if that matters for your environment.
 
+> **Note:** Codex agents need `OPENAI_API_KEY` bound per agent under **Agents → (agent) → Secrets & variables**. The server-level variable is not used, and a Codex run without a per-agent key fails with `configuration_incomplete`.
+
 ## 8. AWS Load Balancer Controller
 
 The controller turns a Kubernetes Ingress into an ALB. Create its IAM policy and service account, then install it with Helm:
