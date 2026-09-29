@@ -596,9 +596,11 @@ aws iam delete-role-policy --role-name paperclip-apprunner-instance --policy-nam
 aws iam delete-role-policy --role-name paperclip-apprunner-instance --policy-name StorageAccess
 aws iam delete-role --role-name paperclip-apprunner-instance
 
-# 9. Log groups (App Runner does not delete them with the service)
+# 9. Log groups (App Runner does not delete them with the service).
+# Scope the prefix to this service ID so other services' logs are kept.
+SERVICE_ID=${SERVICE_ARN##*/}
 for g in $(aws logs describe-log-groups \
-  --log-group-name-prefix /aws/apprunner/paperclip-server \
+  --log-group-name-prefix /aws/apprunner/paperclip-server/$SERVICE_ID/ \
   --query 'logGroups[].logGroupName' --output text); do
   aws logs delete-log-group --log-group-name $g
 done
