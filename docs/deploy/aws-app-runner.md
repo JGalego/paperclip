@@ -1,0 +1,557 @@
+---
+title: AWS App Runner
+summary: Deploy Paperclip to AWS using App Runner, RDS Postgres, and S3
+---
+
+Deploy Paperclip to AWS with App Runner (compute), RDS Postgres 17 (database), and S3 (file storage). This guide uses the AWS CLI and produces a single-instance App Runner service with a managed HTTPS endpoint and custom domain. There is no ALB, no cluster, and no certificate to request.
+
+## Limitations
+
+App Runner has no persistent disk and no EFS support. Read this section before choosing it over the [ECS Fargate guide](aws-ecs.md):
+
+- **`/paperclip` is ephemeral.** Anything written to the local filesystem is lost on every deployment, restart, or scale event. That includes agent workspaces, checked-out repositories, and local agent state. Agents can still run, but every run starts from a clean filesystem. Choose ECS Fargate if agents need long-lived working directories.
+- **Uploaded files go to S3.** This guide sets `PAPERCLIP_STORAGE_PROVIDER=s3` so attachments survive deployments.
+- **The secrets master key must be supplied.** By default Paperclip generates its encryption key on disk, which would be regenerated on each deploy and orphan every stored secret. This guide sets `PAPERCLIP_SECRETS_MASTER_KEY` from Secrets Manager instead.
+- **Outbound traffic only reaches RDS through a VPC connector.** Inbound traffic is always public HTTPS.
+- **One instance only.** Paperclip is a single-instance control plane, so the auto scaling configuration is pinned to min 1, max 1. App Runner has no scale-to-zero, but you can pause the service (see Scaling to Zero).
+
+## Prerequisites
+
+- AWS CLI v2 configured with a profile that has admin-level permissions
+- Docker installed locally (for building and pushing the image)
+- A registered domain with DNS you control (for the custom domain)
+- The Paperclip repo cloned locally
+
+Set these shell variables for the rest of the guide:
+
+```bash
+export AWS_REGION=us-east-1
+export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+export PAPERCLIP_DOMAIN=paperclip.example.com   # your domain
+export DB_PASSWORD=$(openssl rand -base64 24 | tr -d '/+=' | head -c 32)
+export AUTH_SECRET=$(openssl rand -base64 32)
+export MASTER_KEY=$(openssl rand -base64 32)
+export BUCKET_NAME=paperclip-storage-$AWS_ACCOUNT_ID
+```
+
+## 1. Create ECR Repository
+
+```bash
+aws ecr create-repository \
+  --repository-name paperclip-server \
+  --image-scanning-configuration scanOnPush=true \
+  --region $AWS_REGION
+```
+
+## 2. Build and Push Docker Image
+
+```bash
+cd /path/to/paperclip
+
+# Authenticate Docker to ECR
+aws ecr get-login-password --region $AWS_REGION \
+  | docker login --username AWS --password-stdin \
+    $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+
+# Build
+docker build -t paperclip-server .
+
+# Tag and push
+docker tag paperclip-server:latest \
+  $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/paperclip-server:latest
+
+docker push \
+  $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/paperclip-server:latest
+```
+
+## 3. Networking (VPC, Subnets, Security Groups)
+
+Use the default VPC or create a dedicated one. The guide assumes the default VPC with public subnets in two AZs.
+
+```bash
+# Get default VPC
+VPC_ID=$(aws ec2 describe-vpcs \
+  --filters Name=isDefault,Values=true \
+  --query 'Vpcs[0].VpcId' --output text)
+
+# Get two subnets (for the VPC connector and RDS)
+SUBNET_IDS=$(aws ec2 describe-subnets \
+  --filters Name=vpc-id,Values=$VPC_ID \
+  --query 'Subnets[0:2].SubnetId' \
+  --output text)
+SUBNET_1=$(echo $SUBNET_IDS | awk '{print $1}')
+SUBNET_2=$(echo $SUBNET_IDS | awk '{print $2}')
+```
+
+Create security groups:
+
+```bash
+# App Runner VPC connector security group — outbound only
+CONNECTOR_SG=$(aws ec2 create-security-group \
+  --group-name paperclip-apprunner \
+  --description "Paperclip App Runner VPC connector" \
+  --vpc-id $VPC_ID \
+  --query 'GroupId' --output text)
+
+# RDS security group — inbound from the connector only
+RDS_SG=$(aws ec2 create-security-group \
+  --group-name paperclip-rds \
+  --description "Paperclip RDS" \
+  --vpc-id $VPC_ID \
+  --query 'GroupId' --output text)
+
+aws ec2 authorize-security-group-ingress \
+  --group-id $RDS_SG \
+  --protocol tcp --port 5432 \
+  --source-group $CONNECTOR_SG
+```
+
+## 4. Create RDS Postgres Instance
+
+```bash
+# Create a DB subnet group that spans our two subnets so RDS can place the instance.
+aws rds create-db-subnet-group \
+  --db-subnet-group-name paperclip-db-subnet \
+  --db-subnet-group-description "Paperclip RDS subnets" \
+  --subnet-ids $SUBNET_1 $SUBNET_2
+
+aws rds create-db-instance \
+  --db-instance-identifier paperclip-db \
+  --db-instance-class db.t4g.micro \
+  --engine postgres \
+  --engine-version 17 \
+  --master-username paperclip \
+  --master-user-password "$DB_PASSWORD" \
+  --allocated-storage 20 \
+  --storage-type gp3 \
+  --vpc-security-group-ids $RDS_SG \
+  --db-subnet-group-name paperclip-db-subnet \
+  --no-publicly-accessible \
+  --backup-retention-period 7 \
+  --no-multi-az \
+  --db-name paperclip \
+  --region $AWS_REGION
+
+# Wait for it to become available (takes 5-10 min)
+aws rds wait db-instance-available \
+  --db-instance-identifier paperclip-db
+
+# Get the endpoint
+RDS_ENDPOINT=$(aws rds describe-db-instances \
+  --db-instance-identifier paperclip-db \
+  --query 'DBInstances[0].Endpoint.Address' --output text)
+
+DATABASE_URL="postgresql://paperclip:${DB_PASSWORD}@${RDS_ENDPOINT}:5432/paperclip"
+```
+
+## 5. Create S3 Bucket
+
+```bash
+# us-east-1 must not pass a LocationConstraint
+aws s3api create-bucket \
+  --bucket $BUCKET_NAME \
+  --region $AWS_REGION
+
+aws s3api put-public-access-block \
+  --bucket $BUCKET_NAME \
+  --public-access-block-configuration \
+    BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+
+aws s3api put-bucket-encryption \
+  --bucket $BUCKET_NAME \
+  --server-side-encryption-configuration \
+    '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+```
+
+> **Note:** In any region other than `us-east-1`, add `--create-bucket-configuration LocationConstraint=$AWS_REGION` to `create-bucket`.
+
+## 6. Store Secrets
+
+```bash
+aws secretsmanager create-secret \
+  --name paperclip/database-url \
+  --secret-string "$DATABASE_URL"
+
+aws secretsmanager create-secret \
+  --name paperclip/anthropic-api-key \
+  --secret-string "YOUR_ANTHROPIC_KEY"
+
+aws secretsmanager create-secret \
+  --name paperclip/better-auth-secret \
+  --secret-string "$AUTH_SECRET"
+
+aws secretsmanager create-secret \
+  --name paperclip/secrets-master-key \
+  --secret-string "$MASTER_KEY"
+
+aws secretsmanager create-secret \
+  --name paperclip/openai-api-key \
+  --secret-string "YOUR_OPENAI_KEY"
+
+aws secretsmanager create-secret \
+  --name paperclip/github-token \
+  --secret-string "YOUR_GITHUB_PAT"
+```
+
+> **Warning:** Back up `paperclip/secrets-master-key`. If it is lost, every secret stored in Paperclip becomes unreadable.
+
+## 7. IAM Roles
+
+App Runner uses two roles: an access role (pulls the image from ECR) and an instance role (application permissions at runtime, including reading secrets and writing to S3).
+
+```bash
+# Access role — lets App Runner pull from ECR
+aws iam create-role \
+  --role-name paperclip-apprunner-access \
+  --assume-role-policy-document '{
+    "Version": "2012-10-17",
+    "Statement": [{
+      "Effect": "Allow",
+      "Principal": {"Service": "build.apprunner.amazonaws.com"},
+      "Action": "sts:AssumeRole"
+    }]
+  }'
+
+aws iam attach-role-policy \
+  --role-name paperclip-apprunner-access \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AWSAppRunnerServicePolicyForECRAccess
+
+# Instance role — application permissions
+aws iam create-role \
+  --role-name paperclip-apprunner-instance \
+  --assume-role-policy-document '{
+    "Version": "2012-10-17",
+    "Statement": [{
+      "Effect": "Allow",
+      "Principal": {"Service": "tasks.apprunner.amazonaws.com"},
+      "Action": "sts:AssumeRole"
+    }]
+  }'
+
+# Allow reading secrets
+aws iam put-role-policy \
+  --role-name paperclip-apprunner-instance \
+  --policy-name SecretsAccess \
+  --policy-document '{
+    "Version": "2012-10-17",
+    "Statement": [{
+      "Effect": "Allow",
+      "Action": ["secretsmanager:GetSecretValue"],
+      "Resource": "arn:aws:secretsmanager:'$AWS_REGION':'$AWS_ACCOUNT_ID':secret:paperclip/*"
+    }]
+  }'
+
+# Allow reading and writing the storage bucket
+aws iam put-role-policy \
+  --role-name paperclip-apprunner-instance \
+  --policy-name StorageAccess \
+  --policy-document '{
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Effect": "Allow",
+        "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+        "Resource": "arn:aws:s3:::'$BUCKET_NAME'/*"
+      },
+      {
+        "Effect": "Allow",
+        "Action": ["s3:ListBucket"],
+        "Resource": "arn:aws:s3:::'$BUCKET_NAME'"
+      }
+    ]
+  }'
+```
+
+## 8. VPC Connector and Auto Scaling
+
+The VPC connector gives the service outbound access to RDS. Note that once a service uses a VPC connector, all of its outbound traffic goes through your VPC, so the subnets need a route to the internet (public subnets in the default VPC work) for calls to model APIs and GitHub.
+
+```bash
+VPC_CONNECTOR_ARN=$(aws apprunner create-vpc-connector \
+  --vpc-connector-name paperclip-connector \
+  --subnets $SUBNET_1 $SUBNET_2 \
+  --security-groups $CONNECTOR_SG \
+  --query 'VpcConnector.VpcConnectorArn' --output text)
+
+# Pin to a single instance
+ASC_ARN=$(aws apprunner create-auto-scaling-configuration \
+  --auto-scaling-configuration-name paperclip-single \
+  --min-size 1 \
+  --max-size 1 \
+  --query 'AutoScalingConfiguration.AutoScalingConfigurationArn' --output text)
+```
+
+> **Note:** A VPC connector on public subnets does not give the service a public IP. If the connector's subnets are private, they need a NAT Gateway for outbound internet access (about $35/mo).
+
+## 9. Create App Runner Service
+
+```bash
+SECRETS_ARN_PREFIX=arn:aws:secretsmanager:$AWS_REGION:$AWS_ACCOUNT_ID:secret:paperclip
+
+cat > /tmp/paperclip-apprunner.json <<EOF
+{
+  "ServiceName": "paperclip-server",
+  "SourceConfiguration": {
+    "AuthenticationConfiguration": {
+      "AccessRoleArn": "arn:aws:iam::$AWS_ACCOUNT_ID:role/paperclip-apprunner-access"
+    },
+    "AutoDeploymentsEnabled": false,
+    "ImageRepository": {
+      "ImageIdentifier": "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/paperclip-server:latest",
+      "ImageRepositoryType": "ECR",
+      "ImageConfiguration": {
+        "Port": "3100",
+        "RuntimeEnvironmentVariables": {
+          "NODE_ENV": "production",
+          "HOST": "0.0.0.0",
+          "PORT": "3100",
+          "SERVE_UI": "true",
+          "PAPERCLIP_HOME": "/paperclip",
+          "PAPERCLIP_INSTANCE_ID": "default",
+          "PAPERCLIP_CONFIG": "/paperclip/instances/default/config.json",
+          "PAPERCLIP_DEPLOYMENT_MODE": "authenticated",
+          "PAPERCLIP_DEPLOYMENT_EXPOSURE": "public",
+          "PAPERCLIP_PUBLIC_URL": "https://$PAPERCLIP_DOMAIN",
+          "PAPERCLIP_MIGRATION_AUTO_APPLY": "true",
+          "HEARTBEAT_SCHEDULER_ENABLED": "true",
+          "PAPERCLIP_STORAGE_PROVIDER": "s3",
+          "PAPERCLIP_STORAGE_S3_BUCKET": "$BUCKET_NAME",
+          "PAPERCLIP_STORAGE_S3_REGION": "$AWS_REGION"
+        },
+        "RuntimeEnvironmentSecrets": {
+          "DATABASE_URL": "$SECRETS_ARN_PREFIX/database-url",
+          "BETTER_AUTH_SECRET": "$SECRETS_ARN_PREFIX/better-auth-secret",
+          "PAPERCLIP_SECRETS_MASTER_KEY": "$SECRETS_ARN_PREFIX/secrets-master-key",
+          "ANTHROPIC_API_KEY": "$SECRETS_ARN_PREFIX/anthropic-api-key",
+          "OPENAI_API_KEY": "$SECRETS_ARN_PREFIX/openai-api-key",
+          "GITHUB_TOKEN": "$SECRETS_ARN_PREFIX/github-token"
+        }
+      }
+    }
+  },
+  "InstanceConfiguration": {
+    "Cpu": "2 vCPU",
+    "Memory": "4 GB",
+    "InstanceRoleArn": "arn:aws:iam::$AWS_ACCOUNT_ID:role/paperclip-apprunner-instance"
+  },
+  "NetworkConfiguration": {
+    "EgressConfiguration": {
+      "EgressType": "VPC",
+      "VpcConnectorArn": "$VPC_CONNECTOR_ARN"
+    }
+  },
+  "HealthCheckConfiguration": {
+    "Protocol": "HTTP",
+    "Path": "/api/health",
+    "Interval": 10,
+    "Timeout": 5,
+    "HealthyThreshold": 1,
+    "UnhealthyThreshold": 5
+  },
+  "AutoScalingConfigurationArn": "$ASC_ARN"
+}
+EOF
+
+SERVICE_ARN=$(aws apprunner create-service \
+  --cli-input-json file:///tmp/paperclip-apprunner.json \
+  --query 'Service.ServiceArn' --output text)
+
+# Wait for the service to reach RUNNING (takes 5-10 min)
+aws apprunner describe-service \
+  --service-arn $SERVICE_ARN \
+  --query 'Service.{status:Status,url:ServiceUrl}'
+```
+
+> **Note:** `PAPERCLIP_PUBLIC_URL` points at your custom domain, which you attach in the next step. Until DNS is in place, the default `*.awsapprunner.com` URL will load but sign-in redirects will target the custom domain.
+
+## 10. Custom Domain and TLS
+
+App Runner provisions and renews the certificate for you. Associate the domain, then add the DNS records it returns:
+
+```bash
+aws apprunner associate-custom-domain \
+  --service-arn $SERVICE_ARN \
+  --domain-name $PAPERCLIP_DOMAIN \
+  --no-enable-www-subdomain
+
+# Shows the certificate validation CNAMEs and the target for your domain
+aws apprunner describe-custom-domains \
+  --service-arn $SERVICE_ARN \
+  --query '{target:DNSTarget,records:CustomDomains[0].CertificateValidationRecords}'
+```
+
+Add the DNS records to your DNS provider:
+- Create the certificate validation CNAME records returned above
+- Create a CNAME or ALIAS record for `$PAPERCLIP_DOMAIN` -> `DNSTarget`
+
+Wait for the domain to become active (takes a few minutes after DNS propagates):
+
+```bash
+aws apprunner describe-custom-domains \
+  --service-arn $SERVICE_ARN \
+  --query 'CustomDomains[0].Status'
+```
+
+## 11. Verify Deployment
+
+```bash
+# Watch the service come up
+aws apprunner describe-service \
+  --service-arn $SERVICE_ARN \
+  --query 'Service.{status:Status,url:ServiceUrl}'
+
+# Check logs (App Runner creates the log groups automatically)
+SERVICE_ID=$(echo $SERVICE_ARN | awk -F/ '{print $3}')
+aws logs tail /aws/apprunner/paperclip-server/$SERVICE_ID/application --since 10m --follow
+
+# Hit the health endpoint
+curl -sf https://$PAPERCLIP_DOMAIN/api/health
+```
+
+**Healthy indicators:**
+- Service status: `RUNNING`
+- Logs show `plugin job coordinator started` and `plugin-loader: loadAll complete`
+- `/api/health` returns 200
+
+## Post-Deploy Security Hardening
+
+After the first user has signed up (which grants admin role), lock down the instance:
+
+```bash
+# Disable public sign-up (prevents unauthorized users from creating accounts).
+# Add PAPERCLIP_AUTH_DISABLE_SIGN_UP to RuntimeEnvironmentVariables in
+# /tmp/paperclip-apprunner.json:
+#   "PAPERCLIP_AUTH_DISABLE_SIGN_UP": "true"
+# then apply it to the running service:
+aws apprunner update-service \
+  --service-arn $SERVICE_ARN \
+  --source-configuration "$(jq -c .SourceConfiguration /tmp/paperclip-apprunner.json)"
+```
+
+Use the invite flow (added in v2026.416.0) to grant access to additional users after sign-up is disabled.
+
+## Deploying Updates
+
+Build, push, and start a new deployment:
+
+```bash
+# Build and push new image
+docker build -t paperclip-server .
+docker tag paperclip-server:latest \
+  $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/paperclip-server:latest
+docker push \
+  $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/paperclip-server:latest
+
+# Roll out
+aws apprunner start-deployment --service-arn $SERVICE_ARN
+
+# Watch the deployment
+aws apprunner list-operations \
+  --service-arn $SERVICE_ARN \
+  --max-results 3 \
+  --query 'OperationSummaryList[*].{type:Type,status:Status,started:StartedAt}'
+```
+
+App Runner performs a rolling update: starts a new instance, waits for it to pass health checks, then shifts traffic and drains the old instance. Because the local filesystem is ephemeral, nothing on disk carries over.
+
+## Rollback
+
+If the new deployment is unhealthy:
+
+```bash
+# App Runner automatically keeps serving the previous deployment if the
+# new one fails its health checks. To roll back manually:
+
+# 1. Push (or re-tag) a known-good image as :latest
+aws ecr describe-images \
+  --repository-name paperclip-server \
+  --query 'sort_by(imageDetails,&imagePushedAt)[-3:].{tags:imageTags,pushed:imagePushedAt}'
+
+# 2. Redeploy
+aws apprunner start-deployment --service-arn $SERVICE_ARN
+```
+
+To make rollbacks cleaner, tag each build with a unique version (for example the git SHA) and point `ImageIdentifier` at that tag with `aws apprunner update-service`, rather than relying on `:latest`.
+
+## Scaling to Zero (Cost Savings)
+
+App Runner cannot scale to zero, but a paused service stops billing for compute:
+
+```bash
+# Stop
+aws apprunner pause-service --service-arn $SERVICE_ARN
+
+# Start
+aws apprunner resume-service --service-arn $SERVICE_ARN
+```
+
+RDS can also be stopped (auto-restarts after 7 days):
+
+```bash
+aws rds stop-db-instance --db-instance-identifier paperclip-db
+aws rds start-db-instance --db-instance-identifier paperclip-db
+```
+
+## Teardown
+
+Remove all resources in reverse order:
+
+```bash
+# 1. App Runner service, VPC connector, and auto scaling configuration
+aws apprunner disassociate-custom-domain \
+  --service-arn $SERVICE_ARN --domain-name $PAPERCLIP_DOMAIN
+aws apprunner delete-service --service-arn $SERVICE_ARN
+# Deletion is async; wait until the service is gone before removing what it uses
+while aws apprunner describe-service --service-arn $SERVICE_ARN >/dev/null 2>&1; do
+  sleep 10
+done
+aws apprunner delete-vpc-connector --vpc-connector-arn $VPC_CONNECTOR_ARN
+aws apprunner delete-auto-scaling-configuration --auto-scaling-configuration-arn $ASC_ARN
+
+# 2. RDS (creates final snapshot)
+aws rds delete-db-instance \
+  --db-instance-identifier paperclip-db \
+  --final-db-snapshot-identifier paperclip-db-final
+aws rds wait db-instance-deleted --db-instance-identifier paperclip-db
+aws rds delete-db-subnet-group --db-subnet-group-name paperclip-db-subnet
+
+# 3. S3 (deletes all uploaded files)
+aws s3 rb s3://$BUCKET_NAME --force
+
+# 4. Secrets
+for s in database-url anthropic-api-key better-auth-secret secrets-master-key openai-api-key github-token; do
+  aws secretsmanager delete-secret --secret-id paperclip/$s --force-delete-without-recovery
+done
+
+# 5. Security groups (after all dependents are gone)
+for sg in $RDS_SG $CONNECTOR_SG; do
+  aws ec2 delete-security-group --group-id $sg
+done
+
+# 6. ECR
+aws ecr delete-repository --repository-name paperclip-server --force
+
+# 7. IAM roles
+aws iam detach-role-policy --role-name paperclip-apprunner-access \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AWSAppRunnerServicePolicyForECRAccess
+aws iam delete-role --role-name paperclip-apprunner-access
+aws iam delete-role-policy --role-name paperclip-apprunner-instance --policy-name SecretsAccess
+aws iam delete-role-policy --role-name paperclip-apprunner-instance --policy-name StorageAccess
+aws iam delete-role --role-name paperclip-apprunner-instance
+```
+
+## Cost Reference
+
+| Service | Config | Monthly |
+|---------|--------|---------|
+| App Runner | 2 vCPU, 4 GB, 1 provisioned instance, 24/7 | ~$90 |
+| RDS Postgres | db.t4g.micro, 20 GB | ~$15 |
+| NAT Gateway | 1 AZ (only if connector uses private subnets) | ~$35 |
+| S3 | 1 GB Standard | ~$0.03 |
+| Secrets Manager | 6 secrets | ~$2.50 |
+| CloudWatch Logs | ~1 GB/mo | ~$0.50 |
+| ECR | ~1 GB | ~$0.10 |
+| **Total (public subnets, no NAT)** | | **~$108/mo** |
+| **Total (private subnets + NAT)** | | **~$143/mo** |
+
+App Runner bills memory for the provisioned instance around the clock and vCPU only while it handles requests, so an idle instance costs less than the figure above. Paperclip's heartbeat scheduler keeps the instance active, so plan for the full amount. Pause the service during off-hours to cut compute cost.
