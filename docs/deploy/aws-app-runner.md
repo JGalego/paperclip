@@ -85,13 +85,32 @@ PUBLIC_SUBNET=$(aws ec2 describe-subnets \
   --filters Name=vpc-id,Values=$VPC_ID Name=availability-zone,Values=$AZ_1 \
   --query 'Subnets[0].SubnetId' --output text)
 
-# Create two private subnets (adjust the CIDRs if they overlap your VPC)
+# Pick two unused /24 ranges for the private subnets. The default VPC's
+# subnets stop at 172.31.95.255, so these are free unless you added subnets.
+PRIVATE_CIDR_1=172.31.100.0/24
+PRIVATE_CIDR_2=172.31.101.0/24
+
+# Check that no existing subnet already uses them (this must print nothing)
+aws ec2 describe-subnets \
+  --filters Name=vpc-id,Values=$VPC_ID \
+  --query "Subnets[?CidrBlock=='$PRIVATE_CIDR_1' || CidrBlock=='$PRIVATE_CIDR_2'].[SubnetId,CidrBlock]" \
+  --output text
+
+# List all subnet ranges if you need to choose different ones
+aws ec2 describe-subnets \
+  --filters Name=vpc-id,Values=$VPC_ID \
+  --query 'Subnets[].CidrBlock' --output text
+
+# Create two private subnets
 SUBNET_1=$(aws ec2 create-subnet \
-  --vpc-id $VPC_ID --availability-zone $AZ_1 --cidr-block 172.31.100.0/24 \
+  --vpc-id $VPC_ID --availability-zone $AZ_1 --cidr-block $PRIVATE_CIDR_1 \
   --query 'Subnet.SubnetId' --output text)
 SUBNET_2=$(aws ec2 create-subnet \
-  --vpc-id $VPC_ID --availability-zone $AZ_2 --cidr-block 172.31.101.0/24 \
+  --vpc-id $VPC_ID --availability-zone $AZ_2 --cidr-block $PRIVATE_CIDR_2 \
   --query 'Subnet.SubnetId' --output text)
+
+# Stop here if either subnet was not created
+echo "$SUBNET_1 $SUBNET_2"
 
 # NAT Gateway in the public subnet
 EIP_ALLOC=$(aws ec2 allocate-address --domain vpc \
@@ -598,10 +617,11 @@ while [ "$(aws ec2 describe-nat-gateways --nat-gateway-ids $NAT_ID \
   sleep 10
 done
 aws ec2 release-address --allocation-id $EIP_ALLOC
-aws ec2 delete-route-table --route-table-id $PRIVATE_RT
+# Deleting the subnets also removes their route table associations
 for SUBNET in $SUBNET_1 $SUBNET_2; do
   aws ec2 delete-subnet --subnet-id $SUBNET
 done
+aws ec2 delete-route-table --route-table-id $PRIVATE_RT
 
 # 7. ECR
 aws ecr delete-repository --repository-name paperclip-server --force

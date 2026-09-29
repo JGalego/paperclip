@@ -473,16 +473,30 @@ curl -sf https://$PAPERCLIP_DOMAIN/api/health
 
 A fresh public instance stays in `bootstrap_pending` until the first admin exists. In `authenticated` + `public` mode, the browser cannot claim admin. You must create a one-time bootstrap invite with the CLI and open it in your browser.
 
-Run the setup wizard in a throwaway pod. It has no volume, so it does not touch the server's `/paperclip` data on EFS:
+Run the setup wizard in a throwaway pod. It has no volume, so it does not touch the server's `/paperclip` data on EFS. It reads `DATABASE_URL` from `paperclip-secrets`, so the RDS password does not appear in the Pod spec:
 
 ```bash
+IMAGE=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/paperclip-server:latest
+
 kubectl run paperclip-bootstrap -n paperclip --rm -it --restart=Never \
-  --image=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/paperclip-server:latest \
-  --env="DATABASE_URL=$DATABASE_URL" \
-  --env="PAPERCLIP_DEPLOYMENT_MODE=authenticated" \
-  --env="PAPERCLIP_DEPLOYMENT_EXPOSURE=public" \
-  --env="PAPERCLIP_PUBLIC_URL=https://$PAPERCLIP_DOMAIN" \
-  -- npx --yes paperclipai onboard
+  --image=$IMAGE \
+  --overrides='{
+    "spec": {
+      "containers": [{
+        "name": "paperclip-bootstrap",
+        "image": "'$IMAGE'",
+        "args": ["npx", "--yes", "paperclipai", "onboard"],
+        "stdin": true,
+        "tty": true,
+        "envFrom": [{"secretRef": {"name": "paperclip-secrets"}}],
+        "env": [
+          {"name": "PAPERCLIP_DEPLOYMENT_MODE", "value": "authenticated"},
+          {"name": "PAPERCLIP_DEPLOYMENT_EXPOSURE", "value": "public"},
+          {"name": "PAPERCLIP_PUBLIC_URL", "value": "https://'$PAPERCLIP_DOMAIN'"}
+        ]
+      }]
+    }
+  }'
 ```
 
 Choose **Quickstart**. The wizard reads the environment above, writes a config inside the throwaway pod, and prints a bootstrap invite URL. Answer **No** when it asks to start Paperclip, so it does not run a second server against the same database.
