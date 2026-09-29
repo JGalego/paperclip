@@ -10,6 +10,8 @@ Deploy Paperclip to AWS with App Runner (compute), RDS Postgres 17 (database), a
 App Runner has no persistent disk and no EFS support. Read this section before choosing it over the [ECS Fargate guide](aws-ecs.md):
 
 - **`/paperclip` is ephemeral.** Anything written to the local filesystem is lost on every deployment, restart, or scale event. That includes agent workspaces, checked-out repositories, and local agent state. Agents can still run, but every run starts from a clean filesystem. Choose ECS Fargate if agents need long-lived working directories.
+- **Local database backups are ephemeral.** Paperclip writes its automatic database backups under `/paperclip`, so each deployment or restart discards them. Rely on the RDS automated backups (7-day retention in this guide) as your backup history.
+- **Updates briefly run two instances.** App Runner starts the new instance before it drains the old one. Both share the same database and scheduler for a short time during each deployment. If that is not acceptable, use the [EKS guide](aws-eks.md), which stops the old pod before it starts the new one.
 - **Uploaded files go to S3.** This guide sets `PAPERCLIP_STORAGE_PROVIDER=s3` so attachments survive deployments.
 - **The secrets master key must be supplied.** By default Paperclip generates its encryption key on disk, which would be regenerated on each deploy and orphan every stored secret. This guide sets `PAPERCLIP_SECRETS_MASTER_KEY` from Secrets Manager instead.
 - **Outbound traffic only reaches RDS through a VPC connector.** Inbound traffic is always public HTTPS.
@@ -66,7 +68,7 @@ docker push \
 
 ## 3. Networking (VPC, Subnets, Security Groups)
 
-Use the default VPC or create a dedicated one. The guide assumes the default VPC with public subnets in two AZs.
+Use the default VPC or create a dedicated one. The guide assumes the default VPC. A VPC connector gives the service private IPs only, so its subnets must be private and route outbound traffic through a NAT Gateway. Without that, Paperclip can reach RDS but cannot call model APIs or GitHub.
 
 ```bash
 # Get default VPC
@@ -74,13 +76,41 @@ VPC_ID=$(aws ec2 describe-vpcs \
   --filters Name=isDefault,Values=true \
   --query 'Vpcs[0].VpcId' --output text)
 
-# Get two subnets (for the VPC connector and RDS)
-SUBNET_IDS=$(aws ec2 describe-subnets \
-  --filters Name=vpc-id,Values=$VPC_ID \
-  --query 'Subnets[0:2].SubnetId' \
-  --output text)
-SUBNET_1=$(echo $SUBNET_IDS | awk '{print $1}')
-SUBNET_2=$(echo $SUBNET_IDS | awk '{print $2}')
+# Get two AZs and one public subnet (for the NAT Gateway)
+AZ_1=$(aws ec2 describe-availability-zones \
+  --query 'AvailabilityZones[0].ZoneName' --output text)
+AZ_2=$(aws ec2 describe-availability-zones \
+  --query 'AvailabilityZones[1].ZoneName' --output text)
+PUBLIC_SUBNET=$(aws ec2 describe-subnets \
+  --filters Name=vpc-id,Values=$VPC_ID Name=availability-zone,Values=$AZ_1 \
+  --query 'Subnets[0].SubnetId' --output text)
+
+# Create two private subnets (adjust the CIDRs if they overlap your VPC)
+SUBNET_1=$(aws ec2 create-subnet \
+  --vpc-id $VPC_ID --availability-zone $AZ_1 --cidr-block 172.31.100.0/24 \
+  --query 'Subnet.SubnetId' --output text)
+SUBNET_2=$(aws ec2 create-subnet \
+  --vpc-id $VPC_ID --availability-zone $AZ_2 --cidr-block 172.31.101.0/24 \
+  --query 'Subnet.SubnetId' --output text)
+
+# NAT Gateway in the public subnet
+EIP_ALLOC=$(aws ec2 allocate-address --domain vpc \
+  --query 'AllocationId' --output text)
+NAT_ID=$(aws ec2 create-nat-gateway \
+  --subnet-id $PUBLIC_SUBNET --allocation-id $EIP_ALLOC \
+  --query 'NatGateway.NatGatewayId' --output text)
+aws ec2 wait nat-gateway-available --nat-gateway-ids $NAT_ID
+
+# Route the private subnets through the NAT Gateway
+PRIVATE_RT=$(aws ec2 create-route-table --vpc-id $VPC_ID \
+  --query 'RouteTable.RouteTableId' --output text)
+aws ec2 create-route \
+  --route-table-id $PRIVATE_RT \
+  --destination-cidr-block 0.0.0.0/0 \
+  --nat-gateway-id $NAT_ID
+for SUBNET in $SUBNET_1 $SUBNET_2; do
+  aws ec2 associate-route-table --route-table-id $PRIVATE_RT --subnet-id $SUBNET
+done
 ```
 
 Create security groups:
@@ -264,7 +294,7 @@ aws iam put-role-policy \
 
 ## 8. VPC Connector and Auto Scaling
 
-The VPC connector gives the service outbound access to RDS. Note that once a service uses a VPC connector, all of its outbound traffic goes through your VPC, so the subnets need a route to the internet (public subnets in the default VPC work) for calls to model APIs and GitHub.
+The VPC connector gives the service outbound access to RDS. Once a service uses a VPC connector, all of its outbound traffic goes through your VPC, so the private subnets from step 3 (with their NAT route) also carry calls to model APIs and GitHub.
 
 ```bash
 VPC_CONNECTOR_ARN=$(aws apprunner create-vpc-connector \
@@ -280,8 +310,6 @@ ASC_ARN=$(aws apprunner create-auto-scaling-configuration \
   --max-size 1 \
   --query 'AutoScalingConfiguration.AutoScalingConfigurationArn' --output text)
 ```
-
-> **Note:** A VPC connector on public subnets does not give the service a public IP. If the connector's subnets are private, they need a NAT Gateway for outbound internet access (about $35/mo).
 
 ## 9. Create App Runner Service
 
@@ -413,9 +441,44 @@ curl -sf https://$PAPERCLIP_DOMAIN/api/health
 - Logs show `plugin job coordinator started` and `plugin-loader: loadAll complete`
 - `/api/health` returns 200
 
+## Create the First Admin
+
+A fresh public instance stays in `bootstrap_pending` until the first admin exists. In `authenticated` + `public` mode, the browser cannot claim admin. You must create a one-time bootstrap invite with the CLI and open it in your browser.
+
+App Runner has no shell access to the running service, so run the CLI in a one-off container on an EC2 host in the same VPC. The host needs Docker, outbound internet access, and permission to pull from ECR. Allow that host into the RDS security group first:
+
+```bash
+aws ec2 authorize-security-group-ingress \
+  --group-id $RDS_SG \
+  --protocol tcp --port 5432 \
+  --source-group <SECURITY_GROUP_OF_THAT_HOST>
+```
+
+On the EC2 host, with the same shell variables set, start the setup wizard in a throwaway container:
+
+```bash
+aws ecr get-login-password --region $AWS_REGION \
+  | docker login --username AWS --password-stdin \
+    $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+
+docker run --rm -it \
+  -e DATABASE_URL="$DATABASE_URL" \
+  -e PAPERCLIP_DEPLOYMENT_MODE=authenticated \
+  -e PAPERCLIP_DEPLOYMENT_EXPOSURE=public \
+  -e PAPERCLIP_PUBLIC_URL="https://$PAPERCLIP_DOMAIN" \
+  $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/paperclip-server:latest \
+  npx --yes paperclipai onboard
+```
+
+Choose **Quickstart**. The wizard reads the environment above, writes a config inside the throwaway container, and prints a bootstrap invite URL. Answer **No** when it asks to start Paperclip, so it does not run a second server against the same database.
+
+> **Note:** `paperclipai auth bootstrap-ceo` alone does not work here. It needs a config file, and the App Runner service is configured through environment variables only.
+
+Open the invite URL, sign up, and accept the invite. That account becomes the first instance admin. Remove the temporary RDS security group rule afterwards.
+
 ## Post-Deploy Security Hardening
 
-After the first user has signed up (which grants admin role), lock down the instance:
+After the first admin has accepted the bootstrap invite, lock down the instance:
 
 ```bash
 # Disable public sign-up (prevents unauthorized users from creating accounts).
@@ -452,7 +515,7 @@ aws apprunner list-operations \
   --query 'OperationSummaryList[*].{type:Type,status:Status,started:StartedAt}'
 ```
 
-App Runner performs a rolling update: starts a new instance, waits for it to pass health checks, then shifts traffic and drains the old instance. Because the local filesystem is ephemeral, nothing on disk carries over.
+App Runner performs a rolling update: starts a new instance, waits for it to pass health checks, then shifts traffic and drains the old instance. For a short time, both instances run the heartbeat scheduler against the same database. Because the local filesystem is ephemeral, nothing on disk carries over. If the overlap is a problem for your workload, use the EKS guide.
 
 ## Rollback
 
@@ -528,10 +591,22 @@ for sg in $RDS_SG $CONNECTOR_SG; do
   aws ec2 delete-security-group --group-id $sg
 done
 
-# 6. ECR
+# 6. NAT Gateway, route table, and private subnets
+aws ec2 delete-nat-gateway --nat-gateway-id $NAT_ID
+while [ "$(aws ec2 describe-nat-gateways --nat-gateway-ids $NAT_ID \
+  --query 'NatGateways[0].State' --output text)" != "deleted" ]; do
+  sleep 10
+done
+aws ec2 release-address --allocation-id $EIP_ALLOC
+aws ec2 delete-route-table --route-table-id $PRIVATE_RT
+for SUBNET in $SUBNET_1 $SUBNET_2; do
+  aws ec2 delete-subnet --subnet-id $SUBNET
+done
+
+# 7. ECR
 aws ecr delete-repository --repository-name paperclip-server --force
 
-# 7. IAM roles
+# 8. IAM roles
 aws iam detach-role-policy --role-name paperclip-apprunner-access \
   --policy-arn arn:aws:iam::aws:policy/service-role/AWSAppRunnerServicePolicyForECRAccess
 aws iam delete-role --role-name paperclip-apprunner-access
@@ -546,12 +621,11 @@ aws iam delete-role --role-name paperclip-apprunner-instance
 |---------|--------|---------|
 | App Runner | 2 vCPU, 4 GB, 1 provisioned instance, 24/7 | ~$90 |
 | RDS Postgres | db.t4g.micro, 20 GB | ~$15 |
-| NAT Gateway | 1 AZ (only if connector uses private subnets) | ~$35 |
+| NAT Gateway | 1 AZ | ~$35 |
 | S3 | 1 GB Standard | ~$0.03 |
 | Secrets Manager | 6 secrets | ~$2.50 |
 | CloudWatch Logs | ~1 GB/mo | ~$0.50 |
 | ECR | ~1 GB | ~$0.10 |
-| **Total (public subnets, no NAT)** | | **~$108/mo** |
-| **Total (private subnets + NAT)** | | **~$143/mo** |
+| **Total** | | **~$143/mo** |
 
 App Runner bills memory for the provisioned instance around the clock and vCPU only while it handles requests, so an idle instance costs less than the figure above. Paperclip's heartbeat scheduler keeps the instance active, so plan for the full amount. Pause the service during off-hours to cut compute cost.

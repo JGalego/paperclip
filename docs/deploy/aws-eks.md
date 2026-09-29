@@ -22,6 +22,7 @@ export CLUSTER_NAME=paperclip
 export PAPERCLIP_DOMAIN=paperclip.example.com   # your domain
 export DB_PASSWORD=$(openssl rand -base64 24 | tr -d '/+=' | head -c 32)
 export AUTH_SECRET=$(openssl rand -base64 32)
+export MASTER_KEY=$(openssl rand -base64 32)
 ```
 
 ## 1. Create ECR Repository
@@ -248,10 +249,13 @@ kubectl create secret generic paperclip-secrets \
   --namespace paperclip \
   --from-literal=DATABASE_URL="$DATABASE_URL" \
   --from-literal=BETTER_AUTH_SECRET="$AUTH_SECRET" \
+  --from-literal=PAPERCLIP_SECRETS_MASTER_KEY="$MASTER_KEY" \
   --from-literal=ANTHROPIC_API_KEY="YOUR_ANTHROPIC_KEY" \
   --from-literal=OPENAI_API_KEY="YOUR_OPENAI_KEY" \
   --from-literal=GITHUB_TOKEN="YOUR_GITHUB_PAT"
 ```
+
+> **Warning:** Back up `$MASTER_KEY` outside the cluster (for example in a password manager or AWS Secrets Manager). Paperclip encrypts stored secrets with this key. If you restore the RDS database without the original key, every secret stored in Paperclip becomes unreadable. Supplying the key here, instead of letting Paperclip generate one on the EFS volume, keeps it separate from the data it protects.
 
 > **Note:** Kubernetes Secrets are only base64-encoded. Enable [envelope encryption with a KMS key](https://docs.aws.amazon.com/eks/latest/userguide/enable-kms.html) on the cluster, or sync from AWS Secrets Manager with the External Secrets Operator, if that matters for your environment.
 
@@ -465,9 +469,31 @@ curl -sf https://$PAPERCLIP_DOMAIN/api/health
 - Logs show `plugin job coordinator started` and `plugin-loader: loadAll complete`
 - `/api/health` returns 200
 
+## Create the First Admin
+
+A fresh public instance stays in `bootstrap_pending` until the first admin exists. In `authenticated` + `public` mode, the browser cannot claim admin. You must create a one-time bootstrap invite with the CLI and open it in your browser.
+
+Run the setup wizard in a throwaway pod. It has no volume, so it does not touch the server's `/paperclip` data on EFS:
+
+```bash
+kubectl run paperclip-bootstrap -n paperclip --rm -it --restart=Never \
+  --image=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/paperclip-server:latest \
+  --env="DATABASE_URL=$DATABASE_URL" \
+  --env="PAPERCLIP_DEPLOYMENT_MODE=authenticated" \
+  --env="PAPERCLIP_DEPLOYMENT_EXPOSURE=public" \
+  --env="PAPERCLIP_PUBLIC_URL=https://$PAPERCLIP_DOMAIN" \
+  -- npx --yes paperclipai onboard
+```
+
+Choose **Quickstart**. The wizard reads the environment above, writes a config inside the throwaway pod, and prints a bootstrap invite URL. Answer **No** when it asks to start Paperclip, so it does not run a second server against the same database.
+
+> **Note:** `paperclipai auth bootstrap-ceo` alone does not work here. It needs a config file, and the Deployment is configured through environment variables only.
+
+Open the invite URL, sign up, and accept the invite. That account becomes the first instance admin.
+
 ## Post-Deploy Security Hardening
 
-After the first user has signed up (which grants admin role), lock down the instance:
+After the first admin has accepted the bootstrap invite, lock down the instance:
 
 ```bash
 # Disable public sign-up (prevents unauthorized users from creating accounts).
