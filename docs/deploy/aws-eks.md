@@ -222,34 +222,11 @@ eksctl create addon \
 kubectl create namespace paperclip
 ```
 
-Create a StorageClass and PersistentVolumeClaim. The `efs-ap` provisioning mode creates an EFS access point that forces UID/GID 1000, matching the `node` user in the Paperclip image:
+Create a StorageClass and PersistentVolumeClaim from the template at `docker/eks/storage.yaml`. The `efs-ap` provisioning mode creates an EFS access point that forces UID/GID 1000, matching the `node` user in the Paperclip image:
 
 ```bash
-cat <<EOF | kubectl apply -f -
-apiVersion: storage.k8s.io/v1
-kind: StorageClass
-metadata:
-  name: paperclip-efs
-provisioner: efs.csi.aws.com
-parameters:
-  provisioningMode: efs-ap
-  fileSystemId: $EFS_ID
-  directoryPerms: "700"
-  uid: "1000"
-  gid: "1000"
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: paperclip-data
-  namespace: paperclip
-spec:
-  accessModes: ["ReadWriteMany"]
-  storageClassName: paperclip-efs
-  resources:
-    requests:
-      storage: 10Gi
-EOF
+sed -e "s|<EFS_ID>|$EFS_ID|g" \
+    docker/eks/storage.yaml | kubectl apply -f -
 ```
 
 Store secrets as a Kubernetes Secret:
@@ -330,125 +307,25 @@ aws acm wait certificate-validated --certificate-arn $CERT_ARN
 
 ## 10. Deploy Paperclip
 
-The Deployment uses the same environment as the ECS task definition. It runs one replica with the `Recreate` strategy: Paperclip is a single-instance control plane (one heartbeat scheduler, one local workspace), so the old pod must stop before the new one starts.
+Apply the Deployment and Service from the template at `docker/eks/deployment.yaml`. It uses the same environment as the ECS task definition. It runs one replica with the `Recreate` strategy: Paperclip is a single-instance control plane (one heartbeat scheduler, one local workspace), so the old pod must stop before the new one starts.
 
 ```bash
-cat <<EOF | kubectl apply -f -
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: paperclip-server
-  namespace: paperclip
-spec:
-  replicas: 1
-  strategy:
-    type: Recreate
-  selector:
-    matchLabels:
-      app: paperclip-server
-  template:
-    metadata:
-      labels:
-        app: paperclip-server
-    spec:
-      containers:
-        - name: paperclip-server
-          image: $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/paperclip-server:latest
-          ports:
-            - containerPort: 3100
-          env:
-            - { name: NODE_ENV, value: "production" }
-            - { name: HOST, value: "0.0.0.0" }
-            - { name: PORT, value: "3100" }
-            - { name: SERVE_UI, value: "true" }
-            - { name: PAPERCLIP_HOME, value: "/paperclip" }
-            - { name: PAPERCLIP_INSTANCE_ID, value: "default" }
-            - { name: PAPERCLIP_CONFIG, value: "/paperclip/instances/default/config.json" }
-            - { name: PAPERCLIP_DEPLOYMENT_MODE, value: "authenticated" }
-            - { name: PAPERCLIP_DEPLOYMENT_EXPOSURE, value: "public" }
-            - { name: PAPERCLIP_PUBLIC_URL, value: "https://$PAPERCLIP_DOMAIN" }
-            - { name: PAPERCLIP_MIGRATION_AUTO_APPLY, value: "true" }
-            - { name: HEARTBEAT_SCHEDULER_ENABLED, value: "true" }
-          envFrom:
-            - secretRef:
-                name: paperclip-secrets
-          resources:
-            requests:
-              cpu: "1"
-              memory: 2Gi
-            limits:
-              cpu: "2"
-              memory: 4Gi
-          readinessProbe:
-            httpGet:
-              path: /api/health
-              port: 3100
-            periodSeconds: 10
-            failureThreshold: 3
-          livenessProbe:
-            httpGet:
-              path: /api/health
-              port: 3100
-            initialDelaySeconds: 60
-            periodSeconds: 30
-            timeoutSeconds: 5
-            failureThreshold: 3
-          volumeMounts:
-            - name: paperclip-data
-              mountPath: /paperclip
-      volumes:
-        - name: paperclip-data
-          persistentVolumeClaim:
-            claimName: paperclip-data
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: paperclip-server
-  namespace: paperclip
-spec:
-  type: ClusterIP
-  selector:
-    app: paperclip-server
-  ports:
-    - port: 80
-      targetPort: 3100
-EOF
+sed -e "s|<ACCOUNT_ID>|$AWS_ACCOUNT_ID|g" \
+    -e "s|<REGION>|$AWS_REGION|g" \
+    -e "s|<DOMAIN>|$PAPERCLIP_DOMAIN|g" \
+    docker/eks/deployment.yaml | kubectl apply -f -
 ```
+
+> **Note:** Do not add `command:` to the container. It replaces the image's `ENTRYPOINT` and removes `tini` as PID 1, so orphaned agent processes are never reaped. Use `args:` if you need to change the server command.
 
 ## 11. Ingress (ALB)
 
+Apply the Ingress from the template at `docker/eks/ingress.yaml`:
+
 ```bash
-cat <<EOF | kubectl apply -f -
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: paperclip-server
-  namespace: paperclip
-  annotations:
-    alb.ingress.kubernetes.io/scheme: internet-facing
-    alb.ingress.kubernetes.io/target-type: ip
-    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80},{"HTTPS":443}]'
-    alb.ingress.kubernetes.io/ssl-redirect: "443"
-    alb.ingress.kubernetes.io/certificate-arn: $CERT_ARN
-    alb.ingress.kubernetes.io/healthcheck-path: /api/health
-    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "30"
-    alb.ingress.kubernetes.io/healthy-threshold-count: "2"
-    alb.ingress.kubernetes.io/unhealthy-threshold-count: "3"
-spec:
-  ingressClassName: alb
-  rules:
-    - host: $PAPERCLIP_DOMAIN
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: paperclip-server
-                port:
-                  number: 80
-EOF
+sed -e "s|<CERT_ARN>|$CERT_ARN|g" \
+    -e "s|<DOMAIN>|$PAPERCLIP_DOMAIN|g" \
+    docker/eks/ingress.yaml | kubectl apply -f -
 
 # Wait for the ALB address (takes 2-3 min)
 ALB_DNS=$(kubectl get ingress paperclip-server -n paperclip \

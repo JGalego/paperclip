@@ -336,6 +336,8 @@ ASC_ARN=$(aws apprunner create-auto-scaling-configuration \
 
 ## 9. Create App Runner Service
 
+Create the service from the template at `docker/apprunner-service.json`. Before creating it, replace the placeholder values:
+
 ```bash
 # App Runner needs each secret's full ARN, including the random suffix
 # Secrets Manager appends to the name. A partial ARN fails at deploy time.
@@ -344,69 +346,19 @@ secret_arn() {
     --secret-id paperclip/$1 --query ARN --output text
 }
 
-cat > /tmp/paperclip-apprunner.json <<EOF
-{
-  "ServiceName": "paperclip-server",
-  "SourceConfiguration": {
-    "AuthenticationConfiguration": {
-      "AccessRoleArn": "arn:aws:iam::$AWS_ACCOUNT_ID:role/paperclip-apprunner-access"
-    },
-    "AutoDeploymentsEnabled": false,
-    "ImageRepository": {
-      "ImageIdentifier": "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/paperclip-server:latest",
-      "ImageRepositoryType": "ECR",
-      "ImageConfiguration": {
-        "Port": "3100",
-        "RuntimeEnvironmentVariables": {
-          "NODE_ENV": "production",
-          "HOST": "0.0.0.0",
-          "PORT": "3100",
-          "SERVE_UI": "true",
-          "PAPERCLIP_HOME": "/paperclip",
-          "PAPERCLIP_INSTANCE_ID": "default",
-          "PAPERCLIP_CONFIG": "/paperclip/instances/default/config.json",
-          "PAPERCLIP_DEPLOYMENT_MODE": "authenticated",
-          "PAPERCLIP_DEPLOYMENT_EXPOSURE": "public",
-          "PAPERCLIP_PUBLIC_URL": "https://$PAPERCLIP_DOMAIN",
-          "PAPERCLIP_MIGRATION_AUTO_APPLY": "true",
-          "HEARTBEAT_SCHEDULER_ENABLED": "true",
-          "PAPERCLIP_STORAGE_PROVIDER": "s3",
-          "PAPERCLIP_STORAGE_S3_BUCKET": "$BUCKET_NAME",
-          "PAPERCLIP_STORAGE_S3_REGION": "$AWS_REGION"
-        },
-        "RuntimeEnvironmentSecrets": {
-          "DATABASE_URL": "$(secret_arn database-url)",
-          "BETTER_AUTH_SECRET": "$(secret_arn better-auth-secret)",
-          "PAPERCLIP_SECRETS_MASTER_KEY": "$(secret_arn secrets-master-key)",
-          "ANTHROPIC_API_KEY": "$(secret_arn anthropic-api-key)",
-          "OPENAI_API_KEY": "$(secret_arn openai-api-key)",
-          "GITHUB_TOKEN": "$(secret_arn github-token)"
-        }
-      }
-    }
-  },
-  "InstanceConfiguration": {
-    "Cpu": "2 vCPU",
-    "Memory": "4 GB",
-    "InstanceRoleArn": "arn:aws:iam::$AWS_ACCOUNT_ID:role/paperclip-apprunner-instance"
-  },
-  "NetworkConfiguration": {
-    "EgressConfiguration": {
-      "EgressType": "VPC",
-      "VpcConnectorArn": "$VPC_CONNECTOR_ARN"
-    }
-  },
-  "HealthCheckConfiguration": {
-    "Protocol": "HTTP",
-    "Path": "/api/health",
-    "Interval": 10,
-    "Timeout": 5,
-    "HealthyThreshold": 1,
-    "UnhealthyThreshold": 5
-  },
-  "AutoScalingConfigurationArn": "$ASC_ARN"
-}
-EOF
+sed -e "s|<ACCOUNT_ID>|$AWS_ACCOUNT_ID|g" \
+    -e "s|<REGION>|$AWS_REGION|g" \
+    -e "s|<DOMAIN>|$PAPERCLIP_DOMAIN|g" \
+    -e "s|<BUCKET_NAME>|$BUCKET_NAME|g" \
+    -e "s|<VPC_CONNECTOR_ARN>|$VPC_CONNECTOR_ARN|g" \
+    -e "s|<ASC_ARN>|$ASC_ARN|g" \
+    -e "s|<DATABASE_URL_SECRET_ARN>|$(secret_arn database-url)|g" \
+    -e "s|<BETTER_AUTH_SECRET_ARN>|$(secret_arn better-auth-secret)|g" \
+    -e "s|<SECRETS_MASTER_KEY_ARN>|$(secret_arn secrets-master-key)|g" \
+    -e "s|<ANTHROPIC_API_KEY_SECRET_ARN>|$(secret_arn anthropic-api-key)|g" \
+    -e "s|<OPENAI_API_KEY_SECRET_ARN>|$(secret_arn openai-api-key)|g" \
+    -e "s|<GITHUB_TOKEN_SECRET_ARN>|$(secret_arn github-token)|g" \
+    docker/apprunner-service.json > /tmp/paperclip-apprunner.json
 
 SERVICE_ARN=$(aws apprunner create-service \
   --cli-input-json file:///tmp/paperclip-apprunner.json \
@@ -643,6 +595,13 @@ aws iam delete-role --role-name paperclip-apprunner-access
 aws iam delete-role-policy --role-name paperclip-apprunner-instance --policy-name SecretsAccess
 aws iam delete-role-policy --role-name paperclip-apprunner-instance --policy-name StorageAccess
 aws iam delete-role --role-name paperclip-apprunner-instance
+
+# 9. Log groups (App Runner does not delete them with the service)
+for g in $(aws logs describe-log-groups \
+  --log-group-name-prefix /aws/apprunner/paperclip-server \
+  --query 'logGroups[].logGroupName' --output text); do
+  aws logs delete-log-group --log-group-name $g
+done
 ```
 
 ## Cost Reference
