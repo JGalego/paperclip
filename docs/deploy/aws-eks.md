@@ -59,11 +59,19 @@ docker push \
 
 `eksctl` creates a dedicated VPC with public and private subnets in two AZs, a managed node group in the private subnets, and the OIDC provider needed for IAM roles for service accounts (IRSA).
 
+Pick a Kubernetes version that is in standard support. EKS bills extended-support versions at a much higher control-plane rate:
+
+```bash
+aws eks describe-cluster-versions \
+  --query 'clusterVersions[?versionStatus==`STANDARD_SUPPORT`].clusterVersion' \
+  --output text
+```
+
 ```bash
 eksctl create cluster \
   --name $CLUSTER_NAME \
   --region $AWS_REGION \
-  --version 1.33 \
+  --version 1.35 \
   --managed \
   --nodegroup-name paperclip-nodes \
   --node-type t3.large \
@@ -504,7 +512,7 @@ kubectl run paperclip-bootstrap -n paperclip --rm -it --restart=Never \
   }'
 ```
 
-Choose **Quickstart**. The wizard reads the environment above, writes a config inside the throwaway pod, and prints a bootstrap invite URL. When it asks **Start Paperclip now?**, choose **No**. The default is **Yes**, so pressing Enter starts a second server against the same database. `HEARTBEAT_SCHEDULER_ENABLED=false` keeps that server from running scheduled work if it starts by mistake; stop the container with `Ctrl+C` if it does.
+Choose **Quickstart**. The wizard reads the environment above, writes a config inside the throwaway pod, and prints a bootstrap invite URL. When it asks **Start Paperclip now?**, choose **No**. The default is **Yes**, so pressing Enter starts a second server against the same database. If that happens, stop the container with `Ctrl+C` right away. `HEARTBEAT_SCHEDULER_ENABLED=false` stops that server from waking agents, but it still runs other background work, such as execution-status sweeps and database backups. On a fresh instance there are no companies or agents yet, so this work has nothing to act on.
 
 > **Note:** `paperclipai auth bootstrap-ceo` alone does not work here. It needs a config file, and the Deployment is configured through environment variables only.
 
