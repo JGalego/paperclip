@@ -403,7 +403,7 @@ kubectl run paperclip-bootstrap -n paperclip --rm -it --restart=Never \
       "containers": [{
         "name": "paperclip-bootstrap",
         "image": "'$IMAGE'",
-        "args": ["npx", "--yes", "paperclipai", "onboard"],
+        "args": ["node", "--import", "./server/node_modules/tsx/dist/loader.mjs", "cli/src/index.ts", "onboard"],
         "stdin": true,
         "tty": true,
         "envFrom": [{"secretRef": {"name": "paperclip-secrets"}}],
@@ -417,6 +417,8 @@ kubectl run paperclip-bootstrap -n paperclip --rm -it --restart=Never \
     }
   }'
 ```
+
+> **Note:** This runs the `paperclipai` CLI that ships inside the Paperclip image, so its version always matches the server and nothing is downloaded from npm. Do not replace it with `npx paperclipai`, which fetches whatever version is newest and runs it with your production database credentials.
 
 Choose **Quickstart**. The wizard reads the environment above, writes a config inside the throwaway pod, and prints a bootstrap invite URL. When it asks **Start Paperclip now?**, use the arrow keys to select **No**, then press Enter. The default is **Yes**, so pressing Enter starts a second server against the same database. If that happens, stop the container with `Ctrl+C` right away. `HEARTBEAT_SCHEDULER_ENABLED=false` stops that server from waking agents, but it still runs other background work, such as execution-status sweeps and database backups. On a fresh instance there are no companies or agents yet, so this work has nothing to act on.
 
