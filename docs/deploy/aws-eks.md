@@ -264,11 +264,20 @@ kubectl create secret generic paperclip-secrets \
 
 ## 8. AWS Load Balancer Controller
 
-The controller turns a Kubernetes Ingress into an ALB. Create its IAM policy and service account, then install it with Helm:
+The controller turns a Kubernetes Ingress into an ALB. Its IAM policy and Helm chart come from public sources, so pin both to one released version and verify them before you use them. The values below are for controller v3.5.0 (chart 3.5.0):
 
 ```bash
-curl -o /tmp/alb-iam-policy.json \
-  https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/main/docs/install/iam_policy.json
+# Pin the controller release. The policy is fetched by commit, which
+# cannot change, rather than by branch or tag.
+ALB_CONTROLLER_COMMIT=11eb202c97e4ae2ee45e0658c4cde9a4b59f33d4   # v3.5.0
+ALB_CHART_VERSION=3.5.0
+ALB_POLICY_SHA256=16f232c9d9f79366fe949c4550ad517a202380058a9e48d45a4e215044a20a6a
+ALB_CHART_SHA256=45051f634b33e10baccb3354d0681b7de787c60445e599fa276e0c9aedd4ccd5
+
+# Download and verify the IAM policy before creating it
+curl -fsSL -o /tmp/alb-iam-policy.json \
+  https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/$ALB_CONTROLLER_COMMIT/docs/install/iam_policy.json
+echo "$ALB_POLICY_SHA256  /tmp/alb-iam-policy.json" | sha256sum -c -
 
 aws iam create-policy \
   --policy-name PaperclipALBControllerPolicy \
@@ -281,10 +290,14 @@ eksctl create iamserviceaccount \
   --attach-policy-arn arn:aws:iam::$AWS_ACCOUNT_ID:policy/PaperclipALBControllerPolicy \
   --approve
 
+# Download and verify the pinned chart, then install that exact file
 helm repo add eks https://aws.github.io/eks-charts
 helm repo update
+helm pull eks/aws-load-balancer-controller --version $ALB_CHART_VERSION --destination /tmp
+echo "$ALB_CHART_SHA256  /tmp/aws-load-balancer-controller-$ALB_CHART_VERSION.tgz" | sha256sum -c -
 
-helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
+helm install aws-load-balancer-controller \
+  /tmp/aws-load-balancer-controller-$ALB_CHART_VERSION.tgz \
   --namespace kube-system \
   --set clusterName=$CLUSTER_NAME \
   --set serviceAccount.create=false \
@@ -295,7 +308,9 @@ helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
 kubectl rollout status deployment/aws-load-balancer-controller -n kube-system
 ```
 
-> **Note:** The policy above tracks the controller's `main` branch. For production, pin both the policy and the Helm chart to the same released version.
+> **Note:** Stop if either `sha256sum -c` check prints `FAILED`. On macOS, use `shasum -a 256 -c -` instead of `sha256sum -c -`.
+
+> **Note:** To move to a newer controller release, update all four values together. Take the release commit from the [controller releases](https://github.com/kubernetes-sigs/aws-load-balancer-controller/releases), the chart version whose `appVersion` matches that release, and the chart digest from `https://aws.github.io/eks-charts/index.yaml`. Compute the policy hash from the file at that commit, and review the policy before you create it.
 
 ## 9. TLS Certificate
 
