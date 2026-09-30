@@ -274,14 +274,14 @@ ALB_CHART_VERSION=3.5.0
 ALB_POLICY_SHA256=16f232c9d9f79366fe949c4550ad517a202380058a9e48d45a4e215044a20a6a
 ALB_CHART_SHA256=45051f634b33e10baccb3354d0681b7de787c60445e599fa276e0c9aedd4ccd5
 
-# Download and verify the IAM policy before creating it
+# Download the IAM policy. It is created only if its checksum matches.
 curl -fsSL -o /tmp/alb-iam-policy.json \
   https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/$ALB_CONTROLLER_COMMIT/docs/install/iam_policy.json
-echo "$ALB_POLICY_SHA256  /tmp/alb-iam-policy.json" | sha256sum -c -
 
-aws iam create-policy \
-  --policy-name PaperclipALBControllerPolicy \
-  --policy-document file:///tmp/alb-iam-policy.json
+echo "$ALB_POLICY_SHA256  /tmp/alb-iam-policy.json" | sha256sum -c - \
+  && aws iam create-policy \
+       --policy-name PaperclipALBControllerPolicy \
+       --policy-document file:///tmp/alb-iam-policy.json
 
 eksctl create iamserviceaccount \
   --cluster $CLUSTER_NAME \
@@ -290,25 +290,26 @@ eksctl create iamserviceaccount \
   --attach-policy-arn arn:aws:iam::$AWS_ACCOUNT_ID:policy/PaperclipALBControllerPolicy \
   --approve
 
-# Download and verify the pinned chart, then install that exact file
+# Download the pinned chart. That exact file is installed only if its
+# checksum matches.
 helm repo add eks https://aws.github.io/eks-charts
 helm repo update
 helm pull eks/aws-load-balancer-controller --version $ALB_CHART_VERSION --destination /tmp
-echo "$ALB_CHART_SHA256  /tmp/aws-load-balancer-controller-$ALB_CHART_VERSION.tgz" | sha256sum -c -
 
-helm install aws-load-balancer-controller \
-  /tmp/aws-load-balancer-controller-$ALB_CHART_VERSION.tgz \
-  --namespace kube-system \
-  --set clusterName=$CLUSTER_NAME \
-  --set serviceAccount.create=false \
-  --set serviceAccount.name=aws-load-balancer-controller \
-  --set region=$AWS_REGION \
-  --set vpcId=$VPC_ID
+echo "$ALB_CHART_SHA256  /tmp/aws-load-balancer-controller-$ALB_CHART_VERSION.tgz" | sha256sum -c - \
+  && helm install aws-load-balancer-controller \
+       /tmp/aws-load-balancer-controller-$ALB_CHART_VERSION.tgz \
+       --namespace kube-system \
+       --set clusterName=$CLUSTER_NAME \
+       --set serviceAccount.create=false \
+       --set serviceAccount.name=aws-load-balancer-controller \
+       --set region=$AWS_REGION \
+       --set vpcId=$VPC_ID
 
 kubectl rollout status deployment/aws-load-balancer-controller -n kube-system
 ```
 
-> **Note:** Stop if either `sha256sum -c` check prints `FAILED`. On macOS, use `shasum -a 256 -c -` instead of `sha256sum -c -`.
+> **Note:** Each `sha256sum -c` check guards the command chained after it with `&&`. If a check prints `FAILED`, the policy is not created or the chart is not installed. Stop and find out why before you continue. On macOS, use `shasum -a 256 -c -` instead of `sha256sum -c -`.
 
 > **Note:** To move to a newer controller release, update all four values together. Take the release commit from the [controller releases](https://github.com/kubernetes-sigs/aws-load-balancer-controller/releases), the chart version whose `appVersion` matches that release, and the chart digest from `https://aws.github.io/eks-charts/index.yaml`. Compute the policy hash from the file at that commit, and review the policy before you create it.
 
